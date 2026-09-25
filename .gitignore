@@ -1,0 +1,28 @@
+# 编译产物
+target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+
+# 日志
+logs/
+*.log
+
+# 环境凭据：绝不许入库（标注规范红线）
+.env
+*.env
+application-local.yml
+**/application-secret.yml
+
+# OS / 杂项
+.DS_Store
+*.tmp
