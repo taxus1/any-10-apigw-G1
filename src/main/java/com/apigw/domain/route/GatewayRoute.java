@@ -4,17 +4,19 @@ import com.apigw.common.exception.BizException;
 import lombok.Getter;
 import lombok.Setter;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
 /**
  * 聚合根：一条网关路由，连同它的全部匹配条件与转发动作。
  *
  * 聚合不变量（本类负责守住）：
  * 1. routeNo 建后不可改，且只允许字母数字与 . _ -；
- * 2. upstream 必须以 http:// 或 https:// 开头；
+ * 2. upstream 必须是带 http/https 协议且主机名合法的 URL；
  * 3. 同一 kind 的子项顺序号必须从 1 起、连续、不重；
  * 4. 类型/方向/必填项由 {@link GatewayRule#validateAs} 守住。
  *
@@ -84,16 +86,34 @@ public class GatewayRoute {
         this.name = name.trim();
     }
 
-    /** 改上游：必须带 http:// 或 https:// 前缀，纯主机名不算数。 */
+    /** 改上游：必须是带 http/https 协议、且主机名解析得出的合法 URL，乱码不收。 */
     public void changeUpstream(String upstream) {
         if (upstream == null || upstream.isBlank()) {
             throw new BizException("上游地址不能为空");
         }
         String v = upstream.trim();
-        if (!v.startsWith("http://") && !v.startsWith("https://")) {
+        URI uri;
+        try {
+            uri = new URI(v);
+        } catch (URISyntaxException e) {
+            throw new BizException("上游地址不是合法 URL：" + v);
+        }
+        String scheme = uri.getScheme();
+        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
             throw new BizException("上游地址必须以 http:// 或 https:// 开头");
         }
+        if (uri.getHost() == null || uri.getHost().isBlank()) {
+            throw new BizException("上游地址缺主机名或主机名不合法：" + v);
+        }
         this.upstream = v;
+    }
+
+    /** 启用开关只认 1（启用）/ 0（停用），其余一律挡回。 */
+    public void setEnabled(Integer enabled) {
+        if (enabled != null && enabled != 0 && enabled != 1) {
+            throw new BizException("启用开关只能是 1（启用）或 0（停用），收到：" + enabled);
+        }
+        this.enabled = enabled;
     }
 
     /**
@@ -111,20 +131,24 @@ public class GatewayRoute {
 
     /** 同 kind 的顺序号必须从 1 起、连续、不重；每条自身也要通过类型校验。 */
     private void validateKind(List<GatewayRule> rules, String kind) {
-        Set<Integer> seen = new HashSet<>();
+        String label = RuleTypes.KIND_CONDITION.equals(kind) ? "匹配条件" : "转发动作";
+        // 顺序号 → 首次出现的位次，撞车时能指出是哪两条
+        Map<Integer, Integer> firstSeenAt = new HashMap<>();
         for (int i = 0; i < rules.size(); i++) {
             GatewayRule r = rules.get(i);
             if (r == null) {
-                throw new BizException("第 " + (i + 1) + " 条子项为空");
+                throw new BizException(label + "第 " + (i + 1) + " 条为空");
             }
             r.validateAs(kind, i + 1);
-            if (!seen.add(r.getSortNo())) {
-                throw new BizException("顺序号 " + r.getSortNo() + " 重复，同一路由内顺序号不能撞车");
+            Integer prev = firstSeenAt.putIfAbsent(r.getSortNo(), i + 1);
+            if (prev != null) {
+                throw new BizException(label + "第 " + (i + 1) + " 条与第 " + prev
+                        + " 条顺序号撞车（都是 " + r.getSortNo() + "），同一路由内顺序号不能重复");
             }
         }
         for (int n = 1; n <= rules.size(); n++) {
-            if (!seen.contains(n)) {
-                throw new BizException("顺序号必须从 1 起连续，缺了 " + n);
+            if (!firstSeenAt.containsKey(n)) {
+                throw new BizException(label + "的顺序号必须从 1 起连续，缺了 " + n);
             }
         }
     }

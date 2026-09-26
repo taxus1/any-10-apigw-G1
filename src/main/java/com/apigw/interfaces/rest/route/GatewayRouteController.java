@@ -46,11 +46,16 @@ public class GatewayRouteController {
                 .map(Result::ok);
     }
 
-    /** 修改路由（编号不可改）。 */
+    /** 修改路由（编号不可改）。body 里的编号可留空（取路径上的），与路径不一致则拒。 */
     @PutMapping("/{routeNo}")
     public Mono<Result<RouteDetailVO>> update(@PathVariable String routeNo,
                                               @RequestBody RouteSaveVO body) {
-        GatewayRoute route = toDomain(body);
+        String bodyNo = body.routeNo();
+        RouteSaveVO effective = (bodyNo == null || bodyNo.isBlank())
+                ? new RouteSaveVO(routeNo, body.name(), body.upstream(), body.enabled(),
+                        body.remark(), body.version(), body.conditions(), body.actions())
+                : body;
+        GatewayRoute route = toDomain(effective);
         return appService.update(routeNo, route)
                 .map(RouteDetailVO::of)
                 .map(Result::ok);

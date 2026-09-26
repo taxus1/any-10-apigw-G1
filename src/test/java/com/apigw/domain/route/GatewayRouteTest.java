@@ -49,13 +49,45 @@ class GatewayRouteTest {
     }
 
     @Test
+    void upstream_rejectsGarbage() {
+        // 空串
+        assertThrows(BizException.class, () -> GatewayRoute.create("r1", "n", "  ", 1, null));
+        // 只有协议头，没有主机
+        assertThrows(BizException.class, () -> GatewayRoute.create("r1", "n", "http://", 1, null));
+        // 主机名是乱码符号
+        assertThrows(BizException.class, () -> GatewayRoute.create("r1", "n", "http://@@##", 1, null));
+        // 中间带空格的非法 URL
+        assertThrows(BizException.class, () -> GatewayRoute.create("r1", "n", "ht tp://x", 1, null));
+        // 非 http 协议
+        assertThrows(BizException.class, () -> GatewayRoute.create("r1", "n", "ftp://order-svc:21", 1, null));
+    }
+
+    @Test
+    void enabled_onlyZeroOrOne() {
+        BizException e = assertThrows(BizException.class,
+                () -> GatewayRoute.create("r1", "n", "http://h:1", 7, null));
+        assertEquals("启用开关只能是 1（启用）或 0（停用），收到：7", e.getMessage());
+    }
+
+    @Test
     void conditions_sortNoMustBeUnique() {
         GatewayRoute r = base();
         List<GatewayRule> cs = List.of(
                 GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/order/", 1),
                 GatewayRule.create(null, RuleTypes.TYPE_METHOD, null, "GET", 1));
         BizException e = assertThrows(BizException.class, () -> r.replaceRules(cs, List.of()));
-        assertEquals("顺序号 1 重复，同一路由内顺序号不能撞车", e.getMessage());
+        assertEquals("匹配条件第 2 条与第 1 条顺序号撞车（都是 1），同一路由内顺序号不能重复", e.getMessage());
+    }
+
+    @Test
+    void actions_sortNoConflict_pointsToBothOrdinals() {
+        GatewayRoute r = base();
+        List<GatewayRule> as = List.of(
+                GatewayRule.create(null, RuleTypes.TYPE_REQ_ADD_HEADER, "X-A", "1", 2),
+                GatewayRule.create(null, RuleTypes.TYPE_REQ_ADD_HEADER, "X-B", "2", 1),
+                GatewayRule.create(null, RuleTypes.TYPE_REQ_ADD_HEADER, "X-C", "3", 2));
+        BizException e = assertThrows(BizException.class, () -> r.replaceRules(List.of(), as));
+        assertEquals("转发动作第 3 条与第 1 条顺序号撞车（都是 2），同一路由内顺序号不能重复", e.getMessage());
     }
 
     @Test
@@ -65,7 +97,17 @@ class GatewayRouteTest {
                 GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/order/", 1),
                 GatewayRule.create(null, RuleTypes.TYPE_METHOD, null, "GET", 3));
         BizException e = assertThrows(BizException.class, () -> r.replaceRules(cs, List.of()));
-        assertEquals("顺序号必须从 1 起连续，缺了 2", e.getMessage());
+        assertEquals("匹配条件的顺序号必须从 1 起连续，缺了 2", e.getMessage());
+    }
+
+    @Test
+    void actions_sortNoGap_isRejected() {
+        GatewayRoute r = base();
+        List<GatewayRule> as = List.of(
+                GatewayRule.create(null, RuleTypes.TYPE_REQ_REMOVE_HEADER, "X-A", null, 1),
+                GatewayRule.create(null, RuleTypes.TYPE_RESP_ADD_HEADER, "X-B", "v", 3));
+        BizException e = assertThrows(BizException.class, () -> r.replaceRules(List.of(), as));
+        assertEquals("转发动作的顺序号必须从 1 起连续，缺了 2", e.getMessage());
     }
 
     @Test
@@ -74,7 +116,8 @@ class GatewayRouteTest {
         List<GatewayRule> cs = List.of(
                 GatewayRule.create(null, "COOKIE", "session", "abc", 1));
         BizException e = assertThrows(BizException.class, () -> r.replaceRules(cs, List.of()));
-        assertEquals("第 1 条匹配条件的类型不支持：COOKIE", e.getMessage());
+        assertEquals("匹配条件第 1 条的类型不支持：COOKIE（只支持 PATH_PREFIX / METHOD / HEADER / QUERY）",
+                e.getMessage());
     }
 
     @Test
@@ -91,7 +134,7 @@ class GatewayRouteTest {
         List<GatewayRule> cs = List.of(
                 GatewayRule.create(null, RuleTypes.TYPE_HEADER, null, "v", 1));
         BizException e = assertThrows(BizException.class, () -> r.replaceRules(cs, List.of()));
-        assertEquals("第 1 条匹配条件 缺名字（头名或参数名）", e.getMessage());
+        assertEquals("匹配条件第 1 条缺名字（头名或参数名）", e.getMessage());
     }
 
     @Test
@@ -129,7 +172,7 @@ class GatewayRouteTest {
         List<GatewayRule> as = List.of(
                 GatewayRule.create("REQUEST", RuleTypes.TYPE_RESP_ADD_HEADER, "X-Trace", "t1", 1));
         BizException e = assertThrows(BizException.class, () -> r.replaceRules(List.of(), as));
-        assertEquals("第 1 条动作的方向与类型对不上：RESP_ADD_HEADER 应为 RESPONSE", e.getMessage());
+        assertEquals("转发动作第 1 条的方向与类型对不上：RESP_ADD_HEADER 应为 RESPONSE", e.getMessage());
     }
 
     @Test

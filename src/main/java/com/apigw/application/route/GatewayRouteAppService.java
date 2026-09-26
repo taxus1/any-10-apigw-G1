@@ -6,6 +6,8 @@ import com.apigw.domain.route.GatewayRule;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.infrastructure.store.dto.PageResult;
+import org.springframework.cloud.gateway.event.RefreshRoutesEvent;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -28,35 +30,33 @@ public class GatewayRouteAppService {
     private static final int MAX_PAGE_SIZE = 200;
 
     private final RouteStore routeStore;
+    private final ApplicationEventPublisher eventPublisher;
 
-    public GatewayRouteAppService(RouteStore routeStore) {
+    public GatewayRouteAppService(RouteStore routeStore, ApplicationEventPublisher eventPublisher) {
         this.routeStore = routeStore;
+        this.eventPublisher = eventPublisher;
     }
 
-    /** 新建：编号查重 → 分配业务主键 → 写入。 */
+    /** 新建：分配业务主键 → 写入（编号查重在 store 的锁内完成，并发下同编号只进一条）。 */
     public Mono<GatewayRoute> create(GatewayRoute input) {
-        return routeStore.existsByRouteNo(input.getRouteNo())
-                .flatMap(exists -> {
-                    if (Boolean.TRUE.equals(exists)) {
-                        return Mono.error(new BizException("路由编号已存在：" + input.getRouteNo()));
-                    }
-                    if (input.getId() == null) {
-                        input.setId(UUID.randomUUID().toString().replace("-", ""));
-                    }
-                    return routeStore.save(input);
-                });
+        if (input.getId() == null) {
+            input.setId(UUID.randomUUID().toString().replace("-", ""));
+        }
+        return routeStore.saveNew(input)
+                .doOnSuccess(r -> refreshGatewayRoutes());
     }
 
     /** 修改：编号不可改（由聚合兜底），版本比对交给 store。 */
     public Mono<GatewayRoute> update(String routeNo, GatewayRoute input) {
+        // 编号以路径参数为准，传入体里的编号若与之不同，聚合会直接拒掉
+        input.assignRouteNo(routeNo);
         return routeStore.findByRouteNo(routeNo)
                 .switchIfEmpty(Mono.error(new BizException("路由不存在：" + routeNo)))
                 .flatMap(existing -> {
-                    // 编号以路径参数为准，传入体里的编号若与之不同，聚合会直接拒掉
-                    input.assignRouteNo(routeNo);
                     input.setId(existing.getId());
-                    return routeStore.save(input);
-                });
+                    return routeStore.saveExisting(input);
+                })
+                .doOnSuccess(r -> refreshGatewayRoutes());
     }
 
     public Mono<GatewayRoute> detail(String routeNo) {
@@ -65,7 +65,17 @@ public class GatewayRouteAppService {
     }
 
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
-        return routeStore.delete(routeNo, expectVersion);
+        return routeStore.delete(routeNo, expectVersion)
+                .doOnSuccess(v -> refreshGatewayRoutes());
+    }
+
+    /**
+     * 通知网关重新加载路由定义：SCG 监听 RefreshRoutesEvent 后会重新走
+     * RouteDefinitionRepository 拉全量，本实例内改完即生效，不用重启。
+     * （多实例间的广播刷新是后续题，这里只管本实例。）
+     */
+    private void refreshGatewayRoutes() {
+        eventPublisher.publishEvent(new RefreshRoutesEvent(this));
     }
 
     /**
@@ -97,12 +107,12 @@ public class GatewayRouteAppService {
                 || (r.getName() != null && r.getName().toLowerCase(Locale.ROOT).contains(lower));
     }
 
-    /** 把一份外部输入整理成聚合（校验在其中完成）。 */
+    /** 把一份外部输入整理成聚合（校验在其中完成）。version 原样保留，是否必须带由 store 按场景判断。 */
     public GatewayRoute assemble(String routeNo, String name, String upstream, Integer enabled,
                                  String remark, Integer version,
                                  List<GatewayRule> conditions, List<GatewayRule> actions) {
         GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
-        route.setVersion(version == null ? 0 : version);
+        route.setVersion(version);
         route.replaceRules(conditions, actions);
         return route;
     }

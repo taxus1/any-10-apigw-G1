@@ -67,21 +67,35 @@ public class RouteStore {
     }
 
     /**
-     * 保存一条路由（整条覆盖）。
-     *
-     * 并发控制走一把短租约的 Redis 锁：读当前版本 → 比对期望版本 → 写入并版本 +1。
-     * 两个人同时改同一条时，后到的那个拿到的版本已变，会收到「你这份旧了」。
+     * 新建一条路由。查重必须发生在锁内：两个人同时新建同编号路由时，
+     * 后到的一个在临界区里看到已存在，直接拒掉，而不是静默覆盖先到的。
      */
-    public Mono<GatewayRoute> save(GatewayRoute route) {
+    public Mono<GatewayRoute> saveNew(GatewayRoute route) {
         return withLock(route.getRouteNo(), () ->
                 findByRouteNo(route.getRouteNo())
-                        .map(existing -> {
+                        .flatMap(existing -> Mono.<GatewayRoute>error(
+                                new BizException("路由编号已存在：" + route.getRouteNo())))
+                        .switchIfEmpty(Mono.defer(() -> {
+                            route.setVersion(0);
+                            return write(route).thenReturn(route);
+                        })));
+    }
+
+    /**
+     * 修改一条已存在的路由（整条覆盖）。
+     *
+     * 必须带当前版本号：读当前版本 → 比对期望版本 → 写入并版本 +1，全在锁内完成。
+     * 两个人同时改同一条时，后到的那个拿到的版本已变，会收到「你这份旧了」。
+     */
+    public Mono<GatewayRoute> saveExisting(GatewayRoute route) {
+        return withLock(route.getRouteNo(), () ->
+                findByRouteNo(route.getRouteNo())
+                        .switchIfEmpty(Mono.error(new BizException("路由不存在：" + route.getRouteNo())))
+                        .flatMap(existing -> {
                             checkVersion(existing, route);
                             route.setVersion(existing.getVersion() + 1);
-                            return route;
-                        })
-                        .defaultIfEmpty(route)
-                        .flatMap(r -> write(r).thenReturn(r)));
+                            return write(route).thenReturn(route);
+                        }));
     }
 
     /** 删除一条路由，同样带版本比对。 */
@@ -110,7 +124,10 @@ public class RouteStore {
 
     private void checkVersion(GatewayRoute existing, GatewayRoute incoming) {
         Integer expect = incoming.getVersion();
-        if (expect != null && !expect.equals(existing.getVersion())) {
+        if (expect == null) {
+            throw new BizException("修改路由必须带上当前版本号 version（先查详情拿到它），防止覆盖别人的修改");
+        }
+        if (!expect.equals(existing.getVersion())) {
             throw new BizException("这条路由已被别人改过（当前版本 " + existing.getVersion()
                     + "，你手上是 " + expect + "），请刷新后重试");
         }
