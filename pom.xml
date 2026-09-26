@@ -24,7 +24,8 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-cloud.version>2023.0.1</spring-cloud.version>
         <lombok.version>1.18.38</lombok.version>
-        <surefire.skip>true</surefire.skip>
+        <!-- 默认执行测试；依赖真实 Redis 的用例探测不到 6379 时自动跳过 -->
+        <surefire.skip>false</surefire.skip>
     </properties>
 
     <dependencies>

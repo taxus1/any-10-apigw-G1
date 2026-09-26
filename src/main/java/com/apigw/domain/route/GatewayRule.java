@@ -11,6 +11,8 @@ import java.util.Set;
  *
  * 类型与方向的合法组合、各类型的必填项，都由 {@link #validateAs} 统一守住；
  * 顺序号只校验底线（>=1），「从 1 起连续不重」由所属聚合 {@link GatewayRoute} 统一校验。
+ *
+ * 所有报错都带「哪一组、第几条」，调用方不用猜是哪个子项出的问题。
  */
 @Getter
 @Setter
@@ -59,40 +61,46 @@ public class GatewayRule {
     }
 
     /**
-     * 按所属 kind 完整校验一条子项。ordinal 是它在同 kind 列表里的位次（从 1 起），
-     * 出错时带上它，前端能直接指出是哪一行写错了。
+     * 按所属 kind 完整校验一条子项。ordinal 是它在同组列表里的位次（从 1 起），
+     * 出错时带上组名与位次，前端能直接指出是哪一行写错了。
      */
     public void validateAs(String expectedKind, int ordinal) {
+        boolean isCondition = RuleTypes.KIND_CONDITION.equals(expectedKind);
+        String label = isCondition ? "匹配条件" : "转发动作";
+
         if (sortNo == null || sortNo < 1) {
-            throw new BizException("第 " + ordinal + " 条子项的顺序号必须从 1 开始");
+            throw new BizException(label + "第 " + ordinal + " 条的顺序号必须 ≥ 1（同组从 1 开始排）");
         }
         if (type == null || type.isBlank()) {
-            throw new BizException("第 " + ordinal + " 条子项没填类型");
+            throw new BizException(label + "第 " + ordinal + " 条没填类型");
         }
         this.type = type.trim();
 
-        if (RuleTypes.KIND_CONDITION.equals(expectedKind)) {
+        if (isCondition) {
             if (!CONDITION_TYPES.contains(this.type)) {
-                throw new BizException("第 " + ordinal + " 条匹配条件的类型不支持：" + this.type);
+                throw new BizException(label + "第 " + ordinal + " 条的类型不支持：" + this.type
+                        + "（只认 PATH_PREFIX / METHOD / HEADER / QUERY）");
             }
             // 条件恒作用于请求方向，不接受调用方传 RESPONSE
             this.stage = RuleTypes.STAGE_REQUEST;
-            validateFields(ordinal, "匹配条件");
+            validateFields(ordinal, label);
             return;
         }
 
         if (!ACTION_TYPES.contains(this.type)) {
-            throw new BizException("第 " + ordinal + " 条转发动作的类型不支持：" + this.type);
+            throw new BizException(label + "第 " + ordinal + " 条的类型不支持：" + this.type
+                    + "（只认 REQ_ADD_HEADER / REQ_REMOVE_HEADER / RESP_ADD_HEADER / RESP_REMOVE_HEADER）");
         }
         // 动作方向必须与类型自洽，避免 RESP_ADD_HEADER 被标成 REQUEST
         String expectStage = this.type.startsWith("RESP_")
                 ? RuleTypes.STAGE_RESPONSE
                 : RuleTypes.STAGE_REQUEST;
         if (stage != null && !stage.isBlank() && !expectStage.equals(stage.trim())) {
-            throw new BizException("第 " + ordinal + " 条动作的方向与类型对不上：" + this.type + " 应为 " + expectStage);
+            throw new BizException(label + "第 " + ordinal + " 条的方向与类型对不上："
+                    + this.type + " 应为 " + expectStage);
         }
         this.stage = expectStage;
-        validateFields(ordinal, "转发动作");
+        validateFields(ordinal, label);
     }
 
     /** 按具体类型校验 name / value 的必填要求。 */
@@ -101,7 +109,7 @@ public class GatewayRule {
                 && !RuleTypes.TYPE_METHOD.equals(this.type);
         if (nameRequired) {
             if (name == null || name.isBlank()) {
-                throw new BizException("第 " + ordinal + " 条" + label + " 缺名字（头名或参数名）");
+                throw new BizException(label + "第 " + ordinal + " 条缺名字（头名或参数名）");
             }
             this.name = name.trim();
         } else {
@@ -117,7 +125,7 @@ public class GatewayRule {
                 || RuleTypes.TYPE_QUERY.equals(this.type);
         if (valueRequired) {
             if (value == null || value.isBlank()) {
-                throw new BizException("第 " + ordinal + " 条" + label + " 缺取值");
+                throw new BizException(label + "第 " + ordinal + " 条缺取值");
             }
             this.value = value.trim();
         } else {

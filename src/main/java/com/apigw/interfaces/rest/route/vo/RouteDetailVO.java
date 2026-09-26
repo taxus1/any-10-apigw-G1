@@ -2,6 +2,7 @@ package com.apigw.interfaces.rest.route.vo;
 
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.infrastructure.store.RouteStore;
 
 import java.io.Serializable;
 import java.util.List;
@@ -35,8 +36,8 @@ public record RouteDetailVO(String id,
                 r.getEnabled(),
                 r.getRemark(),
                 r.getVersion(),
-                r.getConditions().stream().map(RouteDetailVO::toRuleVo).toList(),
-                r.getActions().stream().map(RouteDetailVO::toRuleVo).toList());
+                RouteStore.sorted(r.getConditions()).stream().map(RouteDetailVO::toRuleVo).toList(),
+                RouteStore.sorted(r.getActions()).stream().map(RouteDetailVO::toRuleVo).toList());
     }
 
     private static RuleVO toRuleVo(GatewayRule g) {

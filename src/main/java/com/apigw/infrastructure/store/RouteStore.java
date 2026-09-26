@@ -7,6 +7,8 @@ import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -18,18 +20,24 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * 路由配置在 Redis 里的读写封装。
  *
- * 存储结构（单 key 存全量，读改都走一份文档）：
+ * 存储结构（一条路由 + 它的全部条件/动作 = Hash 里的一个 field）：
  *   key   = apigw:routes               （Hash）
  *   field = routeNo
  *   value = 该路由及其全部子项的 JSON
  *
- * 为什么用 Hash 而不是一堆独立 key：
- * - 读全量只需一次 HGETALL，配置大量路由时仍是一次往返；
- * - 结构天然是「一份配置」，后面做原子切换 / 版本号时只动这个 key。
+ * 这样「整树保存、整树删除」天然就是原子的：
+ * - 保存只有一次 HSET/HSETNX，删只有一次 HDEL，Redis 单命令不会插进半截，
+ *   不可能出现「主记录进了、子记录没进」的残缺路由，也不需要手工回滚；
+ * - 读出来永远是一整份完整配置，没有无主的子记录可留。
+ *
+ * 编号占用用 HSETNX 原子判定；同一条路由的「读版本→写回」用短租约锁串行化，
+ * 再配合 version 乐观锁：后到的旧版本提交会被拒，提示「你这份旧了」。
  *
  * 这里只负责序列化与并发控制，业务规则在 {@link GatewayRoute} 聚合里。
  */
@@ -40,6 +48,12 @@ public class RouteStore {
 
     private static final Duration LOCK_TTL = Duration.ofSeconds(5);
     private static final int LOCK_RETRY = 50;
+
+    /** 释放锁的 Lua：只有锁的持有者（token 对得上）才能删，避免 TTL 边缘误删别人的锁。 */
+    private static final RedisScript<Long> UNLOCK_SCRIPT = new DefaultRedisScript<>(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    + "return redis.call('del', KEYS[1]) else return 0 end",
+            Long.class);
 
     private final ReactiveStringRedisTemplate redis;
     private final ObjectMapper objectMapper;
@@ -61,42 +75,75 @@ public class RouteStore {
                 .map(v -> deserialize(v.toString()));
     }
 
-    /** 编号是否已被占用（含停用；删除即真正移除，不占号）。 */
-    public Mono<Boolean> existsByRouteNo(String routeNo) {
-        return redis.opsForHash().hasKey(ROUTES_KEY, routeNo);
+    /**
+     * 新建：用 HSETNX 原子占位——field 不存在才写入。
+     *
+     * 「先查有没有、再写」在两步之间有窗口，两个人同时建同一个编号会双双成功；
+     * HSETNX 把查重和写入合成 Redis 里的一个原子动作，谁先谁赢，后来者直接收占用错误。
+     * 停用的路由也占着编号（field 还在），删除才真正释放编号。
+     */
+    public Mono<GatewayRoute> create(GatewayRoute route) {
+        route.setVersion(0);
+        return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), serialize(route))
+                .flatMap(acquired -> Boolean.TRUE.equals(acquired)
+                        ? Mono.just(route)
+                        : Mono.error(new BizException(
+                                "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo())));
     }
 
     /**
-     * 保存一条路由（整条覆盖）。
-     *
-     * 并发控制走一把短租约的 Redis 锁：读当前版本 → 比对期望版本 → 写入并版本 +1。
-     * 两个人同时改同一条时，后到的那个拿到的版本已变，会收到「你这份旧了」。
+     * 修改（整树覆盖）。必须显式带上读取时拿到的 version：
+     * - 锁保证同一时刻只有一个人在「读版本→写回」；
+     * - version 比对保证旧版本提交进不来，写入后版本 +1。
+     * 两个人同时改同一条，后到的拿到的版本已变，会收到明确的「你这份旧了」。
      */
-    public Mono<GatewayRoute> save(GatewayRoute route) {
+    public Mono<GatewayRoute> update(GatewayRoute route) {
+        Integer expectVersion = route.getVersion();
+        if (expectVersion == null) {
+            // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改
+            throw new BizException("修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测");
+        }
         return withLock(route.getRouteNo(), () ->
                 findByRouteNo(route.getRouteNo())
-                        .map(existing -> {
-                            checkVersion(existing, route);
+                        .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + route.getRouteNo())))
+                        .flatMap(existing -> {
+                            if (!expectVersion.equals(existing.getVersion())) {
+                                return Mono.error(versionConflict(existing.getVersion(), expectVersion));
+                            }
+                            // id 沿用旧的，编号建后不可改；整树覆盖子项
+                            route.setId(existing.getId());
                             route.setVersion(existing.getVersion() + 1);
-                            return route;
-                        })
-                        .defaultIfEmpty(route)
-                        .flatMap(r -> write(r).thenReturn(r)));
+                            return write(route).thenReturn(route);
+                        }));
     }
 
-    /** 删除一条路由，同样带版本比对。 */
+    /**
+     * 删除：先确认存在（删不存在的不算成功，给明确结果），再 HDEL。
+     * 条件与动作跟主记录在同一个 field 里，一次 HDEL 整树清掉，不会留无主子记录。
+     * 带上 expectVersion 还能拦住「别人先改了、我手里还是旧版却来删」。
+     */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
         return withLock(routeNo, () ->
                 findByRouteNo(routeNo)
-                        .switchIfEmpty(Mono.error(new BizException("路由不存在：" + routeNo)))
+                        .switchIfEmpty(Mono.error(new BizException(404,
+                                "路由不存在，删除未执行：" + routeNo)))
                         .flatMap(existing -> {
                             if (expectVersion != null && !expectVersion.equals(existing.getVersion())) {
-                                return Mono.error(new BizException(
-                                        "这条路由已被别人改过（当前版本 " + existing.getVersion()
-                                                + "，你手上是 " + expectVersion + "），请刷新后重试"));
+                                return Mono.error(versionConflict(existing.getVersion(), expectVersion));
                             }
                             return redis.opsForHash().remove(ROUTES_KEY, routeNo).then();
                         }));
+    }
+
+    private BizException versionConflict(int currentVersion, int expectVersion) {
+        return new BizException(409, "你这份配置已经旧了（当前版本 " + currentVersion
+                + "，你手上是 " + expectVersion + "），请重新拉取后再提交");
+    }
+
+    private Mono<Void> write(GatewayRoute route) {
+        return redis.opsForHash()
+                .put(ROUTES_KEY, route.getRouteNo(), serialize(route))
+                .then();
     }
 
     /** 用一份完整配置替换整个 Hash —— 给后续「配置整体刷新」留的原子入口。 */
@@ -108,45 +155,33 @@ public class RouteStore {
                 .then();
     }
 
-    private void checkVersion(GatewayRoute existing, GatewayRoute incoming) {
-        Integer expect = incoming.getVersion();
-        if (expect != null && !expect.equals(existing.getVersion())) {
-            throw new BizException("这条路由已被别人改过（当前版本 " + existing.getVersion()
-                    + "，你手上是 " + expect + "），请刷新后重试");
-        }
-    }
-
-    private Mono<Void> write(GatewayRoute route) {
-        return redis.opsForHash()
-                .put(ROUTES_KEY, route.getRouteNo(), serialize(route))
-                .then();
-    }
-
     /**
-     * 拿一把基于 Redis 的短租约锁（SET NX + TTL），保证「读版本 → 写回」这段是临界区。
-     * 拿不到就小睡重试，超时抛业务异常，避免无限自旋。
+     * 拿一把基于 Redis 的短租约锁（SET NX + TTL + 唯一 token），保证「读版本 → 写回」是临界区。
+     * 拿不到就小睡重试，超时抛业务异常，避免无限自旋；释放时用 Lua 比对 token，只删自己的锁。
      */
-    private <T> Mono<T> withLock(String routeNo, java.util.function.Supplier<Mono<T>> action) {
+    private <T> Mono<T> withLock(String routeNo, Supplier<Mono<T>> action) {
         String lockKey = "apigw:lock:route:" + routeNo;
-        return tryLock(lockKey, 0)
+        String token = UUID.randomUUID().toString();
+        return tryLock(lockKey, token, 0)
                 .flatMap(acquired -> {
                     if (!acquired) {
                         return Mono.error(new BizException("这条路由正被另一个人修改，请稍后重试"));
                     }
-                    return action.get().doFinally(sig ->
-                            redis.opsForValue().delete(lockKey).subscribe());
+                    return action.get()
+                            .doFinally(sig -> redis.execute(UNLOCK_SCRIPT, List.of(lockKey), List.of(token))
+                                    .subscribe());
                 });
     }
 
-    private Mono<Boolean> tryLock(String lockKey, int attempt) {
+    private Mono<Boolean> tryLock(String lockKey, String token, int attempt) {
         return redis.opsForValue()
-                .setIfAbsent(lockKey, "1", LOCK_TTL)
+                .setIfAbsent(lockKey, token, LOCK_TTL)
                 .flatMap(ok -> {
                     if (ok || attempt >= LOCK_RETRY) {
                         return Mono.just(ok);
                     }
                     return Mono.delay(Duration.ofMillis(20))
-                            .then(tryLock(lockKey, attempt + 1));
+                            .then(tryLock(lockKey, token, attempt + 1));
                 });
     }
 

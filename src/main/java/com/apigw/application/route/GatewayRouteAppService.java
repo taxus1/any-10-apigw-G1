@@ -4,8 +4,8 @@ import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.infrastructure.store.RouteStore;
-import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.infrastructure.store.dto.PageResult;
+import com.apigw.infrastructure.store.dto.RouteView;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -15,10 +15,10 @@ import java.util.Locale;
 import java.util.UUID;
 
 /**
- * 路由配置的应用服务：编排用例、守住事务/一致性边界。
+ * 路由配置的应用服务：编排用例、守住一致性边界。
  *
- * 业务规则仍放在 {@link GatewayRoute} 聚合里，这里只做：
- * - 「整树保存」的编排：聚合校验 → 编号查重 → 一次写入；
+ * 业务规则放在 {@link GatewayRoute} 聚合里，这里只做：
+ * - 用例编排：新建走 store 的原子占位；修改把编号钉死成路径参数、版本比对交给 store；
  * - 分页与关键字过滤（读多写少，过滤在内存里做，避免为模糊查引入额外索引）；
  * - 列表需要的子项计数，在这里一次算好，不让前端挨个再查。
  */
@@ -26,6 +26,7 @@ import java.util.UUID;
 public class GatewayRouteAppService {
 
     private static final int MAX_PAGE_SIZE = 200;
+    private static final int DEFAULT_PAGE_SIZE = 20;
 
     private final RouteStore routeStore;
 
@@ -33,48 +34,49 @@ public class GatewayRouteAppService {
         this.routeStore = routeStore;
     }
 
-    /** 新建：编号查重 → 分配业务主键 → 写入。 */
+    /**
+     * 新建：聚合校验在 toDomain/assemble 阶段已完成，这里分配内部 id 后交给 store 原子占位。
+     * 编号查重和写入在 Redis 里是一个原子动作，并发建同号只有一个能成。
+     */
     public Mono<GatewayRoute> create(GatewayRoute input) {
-        return routeStore.existsByRouteNo(input.getRouteNo())
-                .flatMap(exists -> {
-                    if (Boolean.TRUE.equals(exists)) {
-                        return Mono.error(new BizException("路由编号已存在：" + input.getRouteNo()));
-                    }
-                    if (input.getId() == null) {
-                        input.setId(UUID.randomUUID().toString().replace("-", ""));
-                    }
-                    return routeStore.save(input);
-                });
+        if (input.getId() == null) {
+            input.setId(UUID.randomUUID().toString().replace("-", ""));
+        }
+        // 新建不接受客户端自带版本，一律从 0 开始；store.create 里也会再钉一次做双保险
+        input.setVersion(0);
+        return routeStore.create(input);
     }
 
-    /** 修改：编号不可改（由聚合兜底），版本比对交给 store。 */
+    /**
+     * 修改：编号以路径参数为准，body 里编号不一致直接拦（聚合兜底「建后不可改」）。
+     * 路由存在性、版本冲突检测都在 store 的锁内完成，避免查改之间再被插队。
+     */
     public Mono<GatewayRoute> update(String routeNo, GatewayRoute input) {
-        return routeStore.findByRouteNo(routeNo)
-                .switchIfEmpty(Mono.error(new BizException("路由不存在：" + routeNo)))
-                .flatMap(existing -> {
-                    // 编号以路径参数为准，传入体里的编号若与之不同，聚合会直接拒掉
-                    input.assignRouteNo(routeNo);
-                    input.setId(existing.getId());
-                    return routeStore.save(input);
-                });
+        // 编号以路径参数为准，body 里编号不一致直接拦（聚合兜底「建后不可改」）；
+        // id 不接受客户端指定，store 里沿用现有 id
+        input.assignRouteNo(routeNo);
+        input.setId(null);
+        return routeStore.update(input);
     }
 
     public Mono<GatewayRoute> detail(String routeNo) {
         return routeStore.findByRouteNo(routeNo)
-                .switchIfEmpty(Mono.error(new BizException("路由不存在：" + routeNo)));
+                .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + routeNo)));
     }
 
+    /** 删除：不存在、版本旧了都会拿到明确的失败结果，绝不静默当成功。 */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
         return routeStore.delete(routeNo, expectVersion);
     }
 
     /**
-     * 分页列表：先按关键字过滤（编号或名称，忽略大小写），再按编号稳定排序，最后切片。
+     * 分页列表：先按关键字过滤（编号或名称，忽略大小写的包含匹配），再按编号稳定排序，最后切片。
      * 列表项带 conditionCount / actionCount，前端不用二次查询。
+     * 每页条数封顶 {@link #MAX_PAGE_SIZE}，防止一次拖全量。
      */
     public Mono<PageResult<RouteView>> page(int pageNum, int pageSize, String keyword) {
         int pn = pageNum < 1 ? 1 : pageNum;
-        int ps = pageSize < 1 ? 20 : Math.min(pageSize, MAX_PAGE_SIZE);
+        int ps = pageSize < 1 ? DEFAULT_PAGE_SIZE : Math.min(pageSize, MAX_PAGE_SIZE);
         String kw = RouteStore.normalizeKeyword(keyword);
 
         return routeStore.findAll()
@@ -97,12 +99,13 @@ public class GatewayRouteAppService {
                 || (r.getName() != null && r.getName().toLowerCase(Locale.ROOT).contains(lower));
     }
 
-    /** 把一份外部输入整理成聚合（校验在其中完成）。 */
+    /** 把一份外部输入整理成聚合（聚合的全部校验在这里同步完成）。 */
     public GatewayRoute assemble(String routeNo, String name, String upstream, Integer enabled,
                                  String remark, Integer version,
                                  List<GatewayRule> conditions, List<GatewayRule> actions) {
         GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
-        route.setVersion(version == null ? 0 : version);
+        // version 原样带入：修改时必须等于当前版本；为空会在 store 被拒
+        route.setVersion(version);
         route.replaceRules(conditions, actions);
         return route;
     }
